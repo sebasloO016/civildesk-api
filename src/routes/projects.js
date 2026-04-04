@@ -9,10 +9,8 @@ const { auditMiddleware } = require('../middlewares/audit');
 const router = Router();
 router.use(authenticate, authorize('proyectos'));
 
-// Conteos por estado (para pipeline)
-router.get('/counts', ctrl.getCounts);
-
 // Proyectos CRUD
+router.get('/counts', ctrl.getCounts);   // ← DEBE ir antes de /:id
 router.get('/',    ctrl.getAll);
 router.get('/:id', ctrl.getOne);
 router.post('/', [
@@ -34,8 +32,9 @@ router.patch('/:id/proformas/:proformaId/status', [
 router.post('/:id/contract', [
   body('contracted_amount').isFloat({ gt: 0 }).withMessage('Monto debe ser mayor a 0'),
 ], validate, ctrl.createContract);
-router.patch('/:id/contract/sign',   ctrl.signContract);
-router.post('/:id/contract/addendum',[
+router.patch('/:id/contract/sign',     ctrl.signContract);
+router.patch('/:id/contract/document', ctrl.updateContractDocument); // ← adjuntar PDF escaneado
+router.post('/:id/contract/addendum', [
   body('description').notEmpty().withMessage('Descripción requerida'),
   body('amount').isFloat({ gt: 0 }).withMessage('Monto debe ser mayor a 0'),
 ], validate, ctrl.addAddendum);

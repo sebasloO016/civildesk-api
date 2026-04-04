@@ -1,5 +1,5 @@
-const { Op } = require('sequelize');
-const { sequelize } = require('../models');
+const { Op, QueryTypes } = require('sequelize');      // ← tipos/operadores
+const { sequelize }      = require('../config/database'); // ← instancia DB
 const {
   Project, Proforma, ProformaItem, Contract,
   ContractAddendum, ProjectLiquidation, Client, User, Work,
@@ -40,8 +40,9 @@ const getOne = async (req, res, next) => {
       include: [
         { model: Client,             as: 'client' },
         { model: User,               as: 'assignedUser', attributes: ['id','first_name','last_name'] },
-        { model: Proforma, as: 'proformas', order: [['version','DESC']],
-          include: [{ model: ProformaItem, as: 'items' }] },
+        { model: Proforma,           as: 'proformas',
+          include: [{ model: ProformaItem, as: 'items' }],
+          order: [['version','DESC']] },
         { model: Contract,           as: 'contract',
           include: [{ model: ContractAddendum, as: 'addendums' }] },
         { model: ProjectLiquidation, as: 'liquidation' },
@@ -55,7 +56,7 @@ const getOne = async (req, res, next) => {
 
 const create = async (req, res, next) => {
   try {
-    const project = await Project.create({ ...req.body, company_id: req.company_id });
+    const project = await Project.create({ ...req.body, company_id: req.company_id, created_by: req.user.id });
     return created(res, project, 'Proyecto creado');
   } catch (err) { next(err); }
 };
@@ -89,33 +90,30 @@ const createProforma = async (req, res, next) => {
   try {
     const { items = [], utility_pct, contingency_pct, ...proformaData } = req.body;
 
-    // Buscar última versión
     const lastVersion = await Proforma.max('version', {
       where: { project_id: req.params.id }, transaction: t,
     });
 
-    // Calcular totales
     const budget = calculateBudget(items, utility_pct, contingency_pct);
 
     const proforma = await Proforma.create({
       ...proformaData,
       ...budget,
-      project_id:  req.params.id,
-      company_id:  req.company_id,
-      created_by:  req.user.id,
-      version:     (lastVersion || 0) + 1,
+      project_id:      req.params.id,
+      company_id:      req.company_id,
+      created_by:      req.user.id,
+      version:         (lastVersion || 0) + 1,
       utility_pct:     utility_pct     || 18,
       contingency_pct: contingency_pct || 10,
     }, { transaction: t });
 
-    // Crear items con total calculado
     if (items.length) {
       await ProformaItem.bulkCreate(
         items.map((item, idx) => ({
           ...item,
           proforma_id: proforma.id,
-          total: parseFloat(item.quantity) * parseFloat(item.unit_price),
-          sort_order: idx,
+          total:       parseFloat(item.quantity) * parseFloat(item.unit_price),
+          sort_order:  idx,
         })),
         { transaction: t }
       );
@@ -147,7 +145,6 @@ const updateProformaStatus = async (req, res, next) => {
 
     await proforma.update(updates);
 
-    // Si se aprueba → avanzar proyecto a CONTRACT
     if (status === 'APPROVED') {
       await Project.update(
         { status: 'CONTRACT' },
@@ -170,18 +167,21 @@ const createContract = async (req, res, next) => {
     });
     if (!project) throw createError('Proyecto no encontrado', 404);
 
-    // Verificar que no existe contrato activo
     const existing = await Contract.findOne({ where: { project_id: req.params.id } });
     if (existing) throw createError('El proyecto ya tiene un contrato', 409);
 
+    // ── Auto-generar contract_number si no viene ──────────────────
+    const contractNumber = req.body.contract_number ||
+      `CON-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`;
+
     const contract = await Contract.create({
       ...req.body,
+      contract_number: contractNumber,
       project_id: req.params.id,
       company_id: req.company_id,
       created_by: req.user.id,
     });
 
-    // Actualizar monto contratado en el proyecto
     await project.update({
       contracted_amount: contract.contracted_amount,
       status:            'CONTRACT',
@@ -198,23 +198,45 @@ const signContract = async (req, res, next) => {
     });
     if (!contract) throw createError('Contrato no encontrado', 404);
 
-    const { signed_pdf_url, client_signer_name, client_signer_id } = req.body;
+    const { signed_pdf_url, signed_document_url, client_signer_name, client_signer_id } = req.body;
 
     await contract.update({
       status:             'SIGNED',
-      signed_pdf_url,
+      // Acepta ambos nombres de campo por compatibilidad
+      signed_pdf_url:      signed_pdf_url || signed_document_url,
+      signed_document_url: signed_document_url || signed_pdf_url,
       client_signer_name,
       client_signer_id,
       client_signed_at:   new Date(),
     });
 
-    // Avanzar proyecto a EXECUTION
     await Project.update(
       { status: 'EXECUTION' },
       { where: { id: req.params.id, company_id: req.company_id } }
     );
 
     return success(res, contract, 'Contrato firmado. Proyecto en ejecución');
+  } catch (err) { next(err); }
+};
+
+// ── PATCH /projects/:id/contract/document ─────────────────────
+// Guardar URL de documento firmado escaneado
+const updateContractDocument = async (req, res, next) => {
+  try {
+    const contract = await Contract.findOne({
+      where: { project_id: req.params.id, company_id: req.company_id },
+    });
+    if (!contract) throw createError('Contrato no encontrado', 404);
+
+    const { signed_document_url, signed_pdf_url } = req.body;
+    const url = signed_document_url || signed_pdf_url;
+
+    await contract.update({
+      signed_document_url: url,
+      signed_pdf_url:      url,
+    });
+
+    return success(res, contract, 'Documento adjuntado');
   } catch (err) { next(err); }
 };
 
@@ -248,27 +270,31 @@ const addAddendum = async (req, res, next) => {
 const createLiquidation = async (req, res, next) => {
   const t = await sequelize.transaction();
   try {
+    // ── FIX: usar Contract (no ContractAddendum) en el include ──
     const project = await Project.findOne({
       where:   { id: req.params.id, company_id: req.company_id },
-      include: [{ model: ContractAddendum, as: 'contract',
-        include: [{ model: ContractAddendum, as: 'addendums' }] }],
+      include: [
+        {
+          model:   Contract,
+          as:      'contract',
+          include: [{ model: ContractAddendum, as: 'addendums' }],
+        },
+      ],
       transaction: t,
     });
     if (!project) throw createError('Proyecto no encontrado', 404);
 
-    // Calcular total final
     const addTotal = req.body.addendums_total || 0;
     const finalAmt = parseFloat(req.body.initial_amount) + parseFloat(addTotal);
 
     const liquidation = await ProjectLiquidation.create({
       ...req.body,
-      project_id:     req.params.id,
-      company_id:     req.company_id,
-      created_by:     req.user.id,
-      final_amount:   finalAmt,
+      project_id:   req.params.id,
+      company_id:   req.company_id,
+      created_by:   req.user.id,
+      final_amount: finalAmt,
     }, { transaction: t });
 
-    // Actualizar proyecto a LIQUIDATION
     await project.update({
       status:       'LIQUIDATION',
       final_amount: finalAmt,
@@ -289,15 +315,15 @@ const signLiquidation = async (req, res, next) => {
     });
     if (!liq) throw createError('Liquidación no encontrada', 404);
 
-    const { signed_pdf_url, client_name, client_id_number } = req.body;
+    const { signed_pdf_url, signed_document_url, client_name, client_id_number } = req.body;
     await liq.update({
-      signed_pdf_url,
+      signed_pdf_url:      signed_pdf_url || signed_document_url,
+      signed_document_url: signed_document_url || signed_pdf_url,
       client_name,
       client_id_number,
       signed_at: new Date(),
     });
 
-    // Cerrar proyecto
     await Project.update(
       { status: 'CLOSED' },
       { where: { id: req.params.id, company_id: req.company_id } }
@@ -307,17 +333,21 @@ const signLiquidation = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// ═══════════════════════════════════════════════════════════════
+// CONTEOS POR ESTADO  (GET /projects/counts)
+// ═══════════════════════════════════════════════════════════════
+
 const getCounts = async (req, res, next) => {
   try {
     const { QueryTypes } = require('sequelize');
     const rows = await sequelize.query(`
-      SELECT status, COUNT(*) as count
+      SELECT status, COUNT(*) AS count
       FROM projects
       WHERE company_id = :company_id
       GROUP BY status
     `, { replacements: { company_id: req.company_id }, type: QueryTypes.SELECT });
 
-    // Convertir array a objeto { PROFORMA: 2, CONTRACT: 1, ... }
+    // { PROFORMA: 2, CONTRACT: 1, EXECUTION: 3, ... }
     const counts = rows.reduce((acc, r) => {
       acc[r.status] = parseInt(r.count);
       return acc;
@@ -330,6 +360,6 @@ const getCounts = async (req, res, next) => {
 module.exports = {
   getAll, getOne, create, update, getCounts,
   getProformas, createProforma, updateProformaStatus,
-  createContract, signContract, addAddendum,
+  createContract, signContract, updateContractDocument, addAddendum,
   createLiquidation, signLiquidation,
 };
