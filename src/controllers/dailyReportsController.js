@@ -35,12 +35,18 @@ const getStats = async (req, res, next) => {
         COUNT(DISTINCT dr.id)                                    AS total_reports,
         COALESCE(SUM(rp.quantity * rp.unit_price), 0)           AS total_purchases,
         COALESCE(AVG(dr.workers_count), 0)                      AS avg_workers,
+        COALESCE(AVG(rc_totals.contractor_workers), 0)          AS avg_contractor_workers,
         MAX(dr.report_date)                                      AS last_report_date,
         COUNT(DISTINCT dr.id) FILTER (
           WHERE dr.report_date >= NOW() - INTERVAL '7 days'
         )                                                        AS reports_last_week
       FROM daily_reports dr
       LEFT JOIN report_purchases rp ON rp.daily_report_id = dr.id
+      LEFT JOIN (
+        SELECT daily_report_id, SUM(workers_count) AS contractor_workers
+        FROM report_contractors
+        GROUP BY daily_report_id
+      ) rc_totals ON rc_totals.daily_report_id = dr.id
       WHERE dr.work_id = :work_id AND dr.company_id = :company_id
     `, {
       replacements: { work_id: req.params.workId, company_id: req.company_id },
@@ -72,7 +78,6 @@ const matchProducts = async (req, res, next) => {
     const { q = '' } = req.query;
     if (q.length < 2) return success(res, []);
 
-    // Búsqueda por similitud: iLike es suficiente para autocompletado
     const products = await Product.findAll({
       where: {
         company_id: req.company_id,
@@ -94,11 +99,9 @@ const matchProducts = async (req, res, next) => {
 // ── Helper: sync price to supplier_products catalog ───────────
 const syncPriceToSupplier = async ({ company_id, supplier_id, product_id, unit_price, recorded_by }, t) => {
   if (!supplier_id || !product_id || !unit_price) return;
-
   const price = parseFloat(unit_price);
   if (price <= 0) return;
 
-  // Check if supplier already has this product
   const existing = await SupplierProduct.findOne({
     where: { supplier_id, product_id },
     transaction: t,
@@ -106,9 +109,7 @@ const syncPriceToSupplier = async ({ company_id, supplier_id, product_id, unit_p
 
   if (existing) {
     const oldPrice = parseFloat(existing.unit_price);
-    if (Math.abs(oldPrice - price) < 0.001) return; // no change
-
-    // Save to price history
+    if (Math.abs(oldPrice - price) < 0.001) return;
     const variation = oldPrice > 0 ? ((price - oldPrice) / oldPrice) * 100 : null;
     await sequelize.query(`
       INSERT INTO product_price_history
@@ -124,11 +125,8 @@ const syncPriceToSupplier = async ({ company_id, supplier_id, product_id, unit_p
       type: QueryTypes.INSERT,
       transaction: t,
     });
-
-    // Update supplier price
     await existing.update({ unit_price: price, last_updated: new Date() }, { transaction: t });
   } else {
-    // First time this supplier sells this product — add to catalog
     await sequelize.query(`
       INSERT INTO supplier_products (company_id, supplier_id, product_id, unit_price, last_updated)
       VALUES (:cid, :sid, :pid, :price, NOW())
@@ -151,18 +149,14 @@ const create = async (req, res, next) => {
       workers_count, photos = [], purchases = [], contractors = [],
     } = req.body;
 
-    // No duplicar fecha
     const existing = await DailyReport.findOne({
       where: { work_id: req.params.workId, report_date, company_id: req.company_id },
       transaction: t,
     });
     if (existing) throw createError('Ya existe un reporte para esta fecha', 409);
 
-    // Calcular total de compras del día (cantidad × precio)
     const totalPurchases = purchases.reduce((s, p) => {
-      const qty   = parseFloat(p.quantity   || 0);
-      const price = parseFloat(p.unit_price || 0);
-      return s + (qty * price);
+      return s + (parseFloat(p.quantity || 0) * parseFloat(p.unit_price || 0));
     }, 0);
 
     const report = await DailyReport.create({
@@ -172,7 +166,6 @@ const create = async (req, res, next) => {
       report_date, weather, activities, novelties, workers_count,
     }, { transaction: t });
 
-    // Fotos
     if (photos.length) {
       await ReportPhoto.bulkCreate(
         photos.map(p => ({ ...p, daily_report_id: report.id, company_id: req.company_id })),
@@ -180,7 +173,6 @@ const create = async (req, res, next) => {
       );
     }
 
-    // Contratistas del día — DB requiere supplier_id NOT NULL
     const validContractors = contractors.filter(c => c.supplier_id);
     if (validContractors.length) {
       await ReportContractor.bulkCreate(
@@ -194,7 +186,6 @@ const create = async (req, res, next) => {
       );
     }
 
-    // ── Compras del día ────────────────────────────────────────
     if (purchases.length) {
       const savedPurchases = await ReportPurchase.bulkCreate(
         purchases.map(p => ({
@@ -212,9 +203,6 @@ const create = async (req, res, next) => {
         { transaction: t, returning: true }
       );
 
-      // ── Sincronizar precios al catálogo de proveedores ────────
-      // Si la compra tiene supplier_id + product_id, actualiza el precio
-      // Esto alimenta el comparador de precios automáticamente
       for (const p of purchases) {
         if (p.supplier_id && p.product_id && parseFloat(p.unit_price) > 0) {
           await syncPriceToSupplier({
@@ -227,7 +215,6 @@ const create = async (req, res, next) => {
         }
       }
 
-      // Registrar egreso financiero agrupado
       if (totalPurchases > 0) {
         const tx = await FinancialTransaction.create({
           company_id:       req.company_id,
@@ -301,4 +288,40 @@ const removePhoto = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-module.exports = { getAll, getOne, getStats, matchProducts, create, update, addPhoto, removePhoto };
+// ── POST /works/:workId/reports/:id/contractors ───────────────
+const addContractor = async (req, res, next) => {
+  try {
+    const report = await DailyReport.findOne({
+      where: { id: req.params.id, work_id: req.params.workId, company_id: req.company_id },
+    });
+    if (!report) throw createError('Reporte no encontrado', 404);
+    const { supplier_id, workers_count, activity } = req.body;
+    if (!supplier_id) throw createError('supplier_id requerido', 400);
+    const contractor = await ReportContractor.create({
+      daily_report_id: report.id,
+      supplier_id:     parseInt(supplier_id),
+      workers_count:   parseInt(workers_count || 1),
+      activity:        activity || null,
+    });
+    return created(res, contractor, 'Contratista agregado');
+  } catch (err) { next(err); }
+};
+
+// ── DELETE /works/:workId/reports/:id/contractors/:cid ────────
+const removeContractor = async (req, res, next) => {
+  try {
+    const contractor = await ReportContractor.findOne({
+      where: { id: req.params.cid },
+    });
+    if (!contractor) throw createError('Contratista no encontrado', 404);
+    await contractor.destroy();
+    return success(res, { id: contractor.id }, 'Contratista eliminado');
+  } catch (err) { next(err); }
+};
+
+module.exports = {
+  getAll, getOne, getStats, matchProducts,
+  create, update,
+  addPhoto, removePhoto,
+  addContractor, removeContractor,
+};

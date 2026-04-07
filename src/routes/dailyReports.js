@@ -7,9 +7,9 @@ const { validate } = require('../middlewares/validate');
 const router = Router({ mergeParams: true });
 router.use(authenticate, authorize('obras'));
 
-// IMPORTANT: static routes must come before /:id
+// Static routes must come before /:id
 router.get('/stats',          ctrl.getStats);
-router.get('/match-products', ctrl.matchProducts);  // fuzzy match for field purchases
+router.get('/match-products', ctrl.matchProducts);
 router.get('/',               ctrl.getAll);
 
 router.post('/', [
@@ -17,14 +17,16 @@ router.post('/', [
   body('activities').notEmpty().withMessage('Actividades requeridas'),
 ], validate, ctrl.create);
 
-// Parameterized routes after statics
+// Parameterized routes
 router.get('/:id',   ctrl.getOne);
 router.put('/:id',   ctrl.update);
 
 router.post('/:id/photos', [
   body('url').notEmpty().withMessage('URL de foto requerida'),
 ], validate, ctrl.addPhoto);
-
 router.delete('/:id/photos/:photoId', ctrl.removePhoto);
+
+router.post('/:id/contractors', ctrl.addContractor);
+router.delete('/:id/contractors/:cid', ctrl.removeContractor);
 
 module.exports = router;
