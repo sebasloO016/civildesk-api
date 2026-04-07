@@ -392,8 +392,11 @@ const generateLiquidationPdf = async ({ liquidation, project, client, company, c
 };
 
 // ── 4. CERTIFICADO DE AVANCE ─────────────────────────────────
-const generateCertificatePdf = async ({ certificate, work, client, company }) => {
-  const pct = parseFloat(certificate.progress_pct);
+const generateCertificatePdf = async ({ certificate, work, client, company, subcontractsTotal = 0, totalObra }) => {
+  const pct      = parseFloat(certificate.progress_pct);
+  const budget   = parseFloat(work.initial_budget || 0);
+  const subTotal = parseFloat(subcontractsTotal || 0);
+  const total    = totalObra || (budget + subTotal);
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
   <style>${BASE_STYLES}</style></head><body>
   <div class="header">
@@ -431,9 +434,10 @@ const generateCertificatePdf = async ({ certificate, work, client, company }) =>
     <table>
       <thead><tr><th>Concepto</th><th style="text-align:right">Valor</th></tr></thead>
       <tbody>
-        <tr><td>Presupuesto total de la obra</td><td style="text-align:right">${fmt(work.initial_budget)}</td></tr>
-        <tr><td>Avance acumulado certificado (${pct.toFixed(1)}%)</td><td style="text-align:right">${fmt(work.initial_budget * pct / 100)}</td></tr>
-      </tbody>
+<tr><td>Recursos propios (presupuesto obra)</td><td style="text-align:right">${fmt(budget)}</td></tr>
+        ${subTotal > 0 ? `<tr><td>Subcontratos</td><td style="text-align:right">${fmt(subTotal)}</td></tr>` : ''}
+        <tr style="background:#f8f9fa;font-weight:700"><td>Presupuesto total de la obra</td><td style="text-align:right">${fmt(total)}</td></tr>
+        <tr><td>Avance acumulado certificado (${pct.toFixed(1)}%)</td><td style="text-align:right">${fmt(total * pct / 100)}</td></tr>      </tbody>
       <tfoot><tr><td>MONTO A FACTURAR</td><td>${fmt(certificate.amount_to_bill)}</td></tr></tfoot>
     </table>
   </div>

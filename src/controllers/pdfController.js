@@ -8,11 +8,13 @@ const {
 
 const {
   Proforma, ProformaItem, Project, Contract, ContractAddendum,
-  ProjectLiquidation, Client, Company, Work,
+  ProjectLiquidation, Client, Company, Work, Subcontract,
   ProgressCertificate, PurchaseOrder, PurchaseOrderItem, Supplier,
 } = require('../models');
 
 const { createError } = require('../middlewares/errorHandler');
+const { QueryTypes }  = require('sequelize');
+const { sequelize }   = require('../config/database');
 
 const getCompany = async (company_id) => {
   const company = await Company.findByPk(company_id);
@@ -125,11 +127,27 @@ const certificatePdf = async (req, res, next) => {
 
     const company = await getCompany(req.company_id);
 
+    // Calcular total de subcontratos activos/completados de esta obra
+    const subRows = await sequelize.query(`
+      SELECT COALESCE(SUM(contracted_amount), 0) AS total_subcontracts
+      FROM subcontracts
+      WHERE work_id = :work_id
+        AND company_id = :company_id
+        AND status != 'CANCELLED'
+    `, {
+      replacements: { work_id: cert.work_id, company_id: req.company_id },
+      type: QueryTypes.SELECT,
+    });
+    const subcontractsTotal = parseFloat(subRows[0]?.total_subcontracts || 0);
+    const totalObra = parseFloat(cert.work.initial_budget || 0) + subcontractsTotal;
+
     const buffer = await generateCertificatePdf({
-      certificate: cert.toJSON(),
-      work:        cert.work.toJSON(),
-      client:      cert.work.client?.toJSON(),
-      company:     company.toJSON(),
+      certificate:      cert.toJSON(),
+      work:             cert.work.toJSON(),
+      client:           cert.work.client?.toJSON(),
+      company:          company.toJSON(),
+      subcontractsTotal,
+      totalObra,
     });
 
     streamPdf(res, buffer, `Certificado-Avance-${cert.certificate_number}.pdf`);

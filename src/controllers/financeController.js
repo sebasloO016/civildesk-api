@@ -1,36 +1,28 @@
-const { Op }            = require('sequelize');
-const { QueryTypes }    = require('sequelize');
-const {
-  sequelize,
-  FinancialTransaction, Work, Supplier,
-} = require('../models');
-const { success, created, paginated } = require('../utils/response');
-const { createError }   = require('../middlewares/errorHandler');
+const { sequelize } = require('../config/database');
+const { QueryTypes } = require('sequelize');
+const { FinancialTransaction } = require('../models');
+const { success, paginated }   = require('../utils/response');
+const { createError }          = require('../middlewares/errorHandler');
 
 // ── GET /finance/transactions ─────────────────────────────────
 const getTransactions = async (req, res, next) => {
   try {
-    const { page = 1, limit = 30, work_id, type, category, date_from, date_to } = req.query;
+    const { page = 1, limit = 20, type, category, work_id, date_from, date_to } = req.query;
     const where = { company_id: req.company_id };
-    if (work_id)  where.work_id  = work_id;
-    if (type)     where.type     = type;
-    if (category) where.category = category;
-    if (date_from || date_to) {
-      where.transaction_date = {};
-      if (date_from) where.transaction_date[Op.gte] = date_from;
-      if (date_to)   where.transaction_date[Op.lte] = date_to;
-    }
+
+    if (type)      where.type     = type;
+    if (category)  where.category = category;
+    if (work_id)   where.work_id  = work_id;
+    if (date_from) where.transaction_date = { ...where.transaction_date, [require('sequelize').Op.gte]: date_from };
+    if (date_to)   where.transaction_date = { ...where.transaction_date, [require('sequelize').Op.lte]: date_to };
 
     const { rows, count } = await FinancialTransaction.findAndCountAll({
       where,
-      include: [
-        { model: Work,     as: 'work',       attributes: ['id','name'] },
-        { model: Supplier, as: 'supplier',   attributes: ['id','name'] },
-      ],
-      order:  [['transaction_date', 'DESC']],
+      order:  [['transaction_date', 'DESC'], ['created_at', 'DESC']],
       limit:  parseInt(limit),
       offset: (parseInt(page) - 1) * parseInt(limit),
     });
+
     return paginated(res, rows, count, page, limit);
   } catch (err) { next(err); }
 };
@@ -41,9 +33,9 @@ const createTransaction = async (req, res, next) => {
     const tx = await FinancialTransaction.create({
       ...req.body,
       company_id:  req.company_id,
-      recorded_by: req.user.id,
+      created_by:  req.user.id,
     });
-    return created(res, tx, 'Transacción registrada');
+    return require('../utils/response').created(res, tx, 'Transacción registrada');
   } catch (err) { next(err); }
 };
 
@@ -58,7 +50,7 @@ const getSummary = async (req, res, next) => {
     if (date_to)   { dateFilter += ` AND transaction_date <= :date_to`;   replacements.date_to   = date_to; }
     if (work_id)   { dateFilter += ` AND work_id = :work_id`;             replacements.work_id   = work_id; }
 
-    // Desglose por categoría (esta query siempre funciona bien)
+    // Desglose por categoría
     const breakdown = await sequelize.query(`
       SELECT
         type,
@@ -71,7 +63,6 @@ const getSummary = async (req, res, next) => {
       ORDER BY type, total DESC
     `, { replacements, type: QueryTypes.SELECT });
 
-    // Calcular totales desde el breakdown (más confiable)
     const total_income  = breakdown
       .filter(r => r.type === 'INCOME')
       .reduce((sum, r) => sum + parseFloat(r.total), 0);
@@ -80,15 +71,19 @@ const getSummary = async (req, res, next) => {
       .filter(r => r.type === 'EXPENSE')
       .reduce((sum, r) => sum + parseFloat(r.total), 0);
 
-    const balance       = total_income - total_expense;
+    const balance = total_income - total_expense;
 
-    // Ahorro total de bodega
-    const savingsRows = await sequelize.query(`
-      SELECT COALESCE(SUM(saved_amount), 0) AS total_savings
-      FROM warehouse_savings
-      WHERE company_id = :company_id
-    `, { replacements: { company_id: req.company_id }, type: QueryTypes.SELECT });
-
+    // Ahorro de bodega (filtrado por obra si aplica)
+    let savingsQuery = `SELECT COALESCE(SUM(saved_amount), 0) AS total_savings FROM warehouse_savings WHERE company_id = :cid`;
+    const savingsReplacements = { cid: req.company_id };
+    if (work_id) {
+      savingsQuery += ` AND work_id = :work_id`;
+      savingsReplacements.work_id = work_id;
+    }
+    const savingsRows = await sequelize.query(savingsQuery, {
+      replacements: savingsReplacements,
+      type: QueryTypes.SELECT,
+    });
     const warehouse_savings = parseFloat(savingsRows[0]?.total_savings || 0);
 
     return success(res, {
@@ -118,10 +113,18 @@ const getWorksSummary = async (req, res, next) => {
 };
 
 // ── GET /finance/cashflow ─────────────────────────────────────
-// Flujo de caja mensual para gráfico
+// Flujo de caja mensual — soporta filtro por work_id para vista de obra
 const getCashflow = async (req, res, next) => {
   try {
-    const { year = new Date().getFullYear() } = req.query;
+    const { year = new Date().getFullYear(), work_id } = req.query;
+
+    const replacements = { company_id: req.company_id, year };
+    let workFilter = '';
+
+    if (work_id) {
+      workFilter = 'AND work_id = :work_id';
+      replacements.work_id = work_id;
+    }
 
     const rows = await sequelize.query(`
       SELECT
@@ -133,10 +136,11 @@ const getCashflow = async (req, res, next) => {
       FROM financial_transactions
       WHERE company_id = :company_id
         AND EXTRACT(YEAR FROM transaction_date) = :year
+        ${workFilter}
       GROUP BY month
       ORDER BY month
     `, {
-      replacements: { company_id: req.company_id, year },
+      replacements,
       type: QueryTypes.SELECT,
     });
 

@@ -112,9 +112,11 @@ const getBudgetSummary = async (req, res, next) => {
 
     const items = work.items;
 
-    // Presupuesto inicial (cantidades iniciales * precio cliente)
+    // Presupuesto inicial al cliente:
+    // Se calcula sobre unit_cost (costo proveedor) aplicando utilidad e imprevistos.
+    // Si unit_cost no está definido, se usa unit_price como fallback.
     const initialBudget = calculateBudget(
-      items.map(i => ({ quantity: i.initial_qty, unit_price: i.unit_price })),
+      items.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
       work.utility_pct,
       work.contingency_pct
     );
@@ -128,21 +130,82 @@ const getBudgetSummary = async (req, res, next) => {
       { replacements: { wid: work.id, cid: req.company_id }, type: QueryTypes.SELECT }
     );
 
-    // Avance ponderado
-    const progress = calculateWeightedProgress(items);
+    // Avance combinado (rubros + subcontratos ponderado por costo)
+    const progress = await calcCombinedProgress(work.id, req.company_id);
 
     // Burn rate
     const burn = budgetBurnRate(realCost, initialBudget.total, progress);
 
+    // Datos del contrato/proyecto vinculado (para panel de rentabilidad)
+    let contractData = null;
+    if (work.project_id) {
+      const projectRows = await sequelize.query(`
+        SELECT
+          p.contracted_amount,
+          p.final_amount,
+          COALESCE(
+            (SELECT SUM(ca.amount) FROM contract_addendums ca
+             JOIN contracts c ON c.id = ca.contract_id
+             WHERE c.project_id = p.id), 0
+          ) AS addendums_total
+        FROM projects p
+        WHERE p.id = :pid AND p.company_id = :cid
+      `, {
+        replacements: { pid: work.project_id, cid: req.company_id },
+        type: QueryTypes.SELECT,
+      });
+      if (projectRows.length) {
+        const pr = projectRows[0];
+        contractData = {
+          contracted_amount: parseFloat(pr.contracted_amount || 0),
+          addendums_total:   parseFloat(pr.addendums_total   || 0),
+          total_to_bill:     parseFloat(pr.contracted_amount || 0) + parseFloat(pr.addendums_total || 0),
+        };
+      }
+    }
+
     return success(res, {
-      initial_budget: initialBudget,
-      real_cost:      realCost,
-      actual_progress: progress,
+      initial_budget:    initialBudget,
+      real_cost:         realCost,
+      actual_progress:   progress,
       warehouse_savings: parseFloat(savings.total),
-      burn_rate:      burn,
-      items_count:    items.length,
+      burn_rate:         burn,
+      items_count:       items.length,
+      contract:          contractData,
     });
   } catch (err) { next(err); }
+};
+
+// ── Helper: calcular avance combinado rubros + subcontratos ───
+const calcCombinedProgress = async (workId, companyId, manualOverride = null) => {
+  // Si hay override manual, usarlo directamente
+  if (manualOverride !== null && manualOverride !== undefined) {
+    return parseFloat(manualOverride);
+  }
+
+  const { Subcontract } = require('../models');
+
+  // Avance de rubros propios (ponderado por costo)
+  const items = await WorkItem.findAll({ where: { work_id: workId } });
+  const rubroProgress = calculateWeightedProgress(items);
+  const rubroBudget   = items.reduce((s, i) =>
+    s + (parseFloat(i.initial_qty || 0) * parseFloat(i.unit_cost || i.unit_price || 0)), 0);
+
+  // Avance de subcontratos (promedio ponderado por monto contratado)
+  const subs = await Subcontract.findAll({
+    where: { work_id: workId, company_id: companyId, status: { [require('sequelize').Op.ne]: 'CANCELLED' } },
+  });
+  const subTotal    = subs.reduce((s, sc) => s + parseFloat(sc.contracted_amount || 0), 0);
+  const subProgress = subTotal > 0
+    ? subs.reduce((s, sc) => s + (parseFloat(sc.progress_pct || 0) * parseFloat(sc.contracted_amount || 0)), 0) / subTotal
+    : 0;
+
+  const totalBudget = rubroBudget + subTotal;
+  if (totalBudget === 0) return 0;
+
+  // Avance ponderado combinado
+  const combined = (rubroProgress * rubroBudget + subProgress * subTotal) / totalBudget;
+  return Math.round(combined * 100) / 100;
 };
 
 // ── POST /works/:id/progress ───────────────────────────────────
@@ -154,8 +217,9 @@ const updateProgress = async (req, res, next) => {
     });
     if (!work) throw createError('Obra no encontrada', 404);
 
+    const { items, manual_override } = req.body;
+
     // Actualizar progress_pct en los items que vienen en el body
-    const { items } = req.body;
     if (items?.length) {
       for (const item of items) {
         await WorkItem.update(
@@ -165,23 +229,33 @@ const updateProgress = async (req, res, next) => {
       }
     }
 
-    // Recalcular avance general ponderado
-    const allItems     = await WorkItem.findAll({ where: { work_id: work.id } });
-    const newProgress  = calculateWeightedProgress(allItems);
-    const realCost     = allItems.reduce((sum, i) => sum + parseFloat(i.real_total || 0), 0);
+    // Recalcular costos desde items
+    const allItems = await WorkItem.findAll({ where: { work_id: work.id } });
+    const realCost = allItems.reduce((sum, i) => sum + parseFloat(i.real_total || 0), 0);
+    const newBudget = calculateBudget(
+      allItems.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
+      work.utility_pct, work.contingency_pct
+    );
 
-    await work.update({ actual_progress: newProgress, real_cost: realCost });
+    // Calcular avance combinado (rubros + subcontratos) o usar override manual
+    const newProgress = await calcCombinedProgress(work.id, req.company_id, manual_override);
+
+    await work.update({
+      actual_progress: newProgress,
+      real_cost:       realCost,
+      initial_budget:  newBudget.total,
+    });
 
     // Guardar snapshot para Curva S
     await ProgressSnapshot.create({
-      company_id:      req.company_id,
-      work_id:         work.id,
-      snapshot_date:   new Date(),
-      planned_progress:work.planned_progress,
-      actual_progress: newProgress,
-      planned_cost:    work.initial_budget,
-      actual_cost:     realCost,
-      recorded_by:     req.user.id,
+      company_id:       req.company_id,
+      work_id:          work.id,
+      snapshot_date:    new Date(),
+      planned_progress: work.planned_progress,
+      actual_progress:  newProgress,
+      planned_cost:     newBudget.total,
+      actual_cost:      realCost,
+      recorded_by:      req.user.id,
     });
 
     return success(res, { actual_progress: newProgress, real_cost: realCost }, 'Avance actualizado');
@@ -209,7 +283,6 @@ const closeWork = async (req, res, next) => {
 
     const { surplus_items = [] } = req.body;
 
-    // Trasladar sobrantes si vienen
     let transferResults = [];
     if (surplus_items.length) {
       transferResults = await inventoryService.transferSurplusToGeneral({
@@ -227,25 +300,17 @@ const closeWork = async (req, res, next) => {
 };
 
 // ── POST /works/from-project/:projectId ───────────────────────
-// Crea una obra vinculada a un proyecto, importando los rubros
-// de la proforma aprobada como WorkItems del presupuesto
+// Crea una obra vinculada a un proyecto.
+// NO importa rubros automáticamente — el ingeniero los agrega manualmente.
+// El initial_budget arranca en 0 y se recalcula al agregar rubros.
 const createFromProject = async (req, res, next) => {
   const t = await sequelize.transaction();
   try {
     const { projectId } = req.params;
 
-    // 1. Cargar el proyecto con su proforma aprobada
+    // 1. Cargar el proyecto
     const project = await Project.findOne({
-      where:   { id: projectId, company_id: req.company_id },
-      include: [{
-        model:   Proforma,
-        as:      'proformas',
-        where:   { status: 'APPROVED' },
-        required: false,
-        include: [{ model: ProformaItem, as: 'items' }],
-        order:   [['version', 'DESC']],
-        limit:   1,
-      }],
+      where: { id: projectId, company_id: req.company_id },
       transaction: t,
     });
 
@@ -260,22 +325,14 @@ const createFromProject = async (req, res, next) => {
     });
     if (existingWork) throw createError('Este proyecto ya tiene una obra vinculada', 409);
 
-    // 2. Tomar la proforma aprobada (o la más reciente si no hay aprobada)
-    let proforma = project.proformas?.[0];
-    if (!proforma) {
-      proforma = await Proforma.findOne({
-        where:   { project_id: projectId },
-        include: [{ model: ProformaItem, as: 'items' }],
-        order:   [['version', 'DESC']],
-        transaction: t,
-      });
-    }
+    // 2. Obtener utility/contingency de la proforma aprobada si existe
+    const proforma = await Proforma.findOne({
+      where:   { project_id: projectId, status: 'APPROVED' },
+      order:   [['version', 'DESC']],
+      transaction: t,
+    });
 
-    // 3. Calcular presupuesto inicial desde el contrato o proforma
-    const initialBudget = parseFloat(project.contracted_amount) ||
-                          parseFloat(proforma?.total) || 0;
-
-    // 4. Crear la obra
+    // 3. Crear la obra con presupuesto inicial en 0 (el ing. agrega sus rubros)
     const { start_date, end_date, assigned_user_id, description } = req.body;
     const work = await Work.create({
       company_id:       req.company_id,
@@ -290,41 +347,14 @@ const createFromProject = async (req, res, next) => {
       estimated_end:    end_date || null,
       utility_pct:      proforma?.utility_pct     || 18,
       contingency_pct:  proforma?.contingency_pct || 10,
-      initial_budget:   initialBudget,
+      initial_budget:   0,   // se recalcula al agregar rubros
       real_cost:        0,
       planned_progress: 0,
       actual_progress:  0,
     }, { transaction: t });
 
-    // 5. Importar ítems de la proforma como WorkItems
-    let itemsCreated = 0;
-    if (proforma?.items?.length) {
-      await WorkItem.bulkCreate(
-        proforma.items.map((item, idx) => ({
-          company_id:    req.company_id,
-          work_id:       work.id,
-          description:   item.description,
-          unit:          item.unit,
-          initial_qty:   parseFloat(item.quantity),
-          real_qty:      0,
-          unit_cost:     parseFloat(item.unit_price), // precio de costo = precio ofertado (se ajusta en campo)
-          unit_price:    parseFloat(item.unit_price), // precio cliente
-          initial_total: parseFloat(item.total || item.quantity * item.unit_price),
-          real_total:    0,
-          progress_pct:  0,
-          sort_order:    idx,
-          catalog_rubro_id: item.catalog_rubro_id || null,
-        })),
-        { transaction: t }
-      );
-      itemsCreated = proforma.items.length;
-    }
-
-    // 6. Crear almacén de obra
+    // 4. Crear almacén de obra
     await inventoryService.createWorkWarehouse(req.company_id, work.id, work.name, t);
-
-    // 7. (No action needed — works.project_id already set above)
-    // The link project→work is queried via works.project_id
 
     await t.commit();
 
@@ -335,14 +365,176 @@ const createFromProject = async (req, res, next) => {
       ],
     });
 
-    return created(res, full,
-      `Obra creada desde proyecto con ${itemsCreated} rubros importados del presupuesto`
-    );
+    return created(res, full, 'Obra creada desde proyecto. Agrega los rubros de presupuesto en la pestaña Presupuesto.');
   } catch (err) {
     await t.rollback();
     next(err);
   }
 };
 
-module.exports = { getAll, getOne, create, createFromProject, update, remove, getBudgetSummary, updateProgress, getCurveS, closeWork };
+// ══════════════════════════════════════════════════════════════
+// CRUD RUBROS DE OBRA (work_items)
+// ══════════════════════════════════════════════════════════════
 
+// ── GET /works/:id/items ───────────────────────────────────────
+const getItems = async (req, res, next) => {
+  try {
+    const items = await WorkItem.findAll({
+      where: { work_id: req.params.id, company_id: req.company_id },
+      order: [['sort_order', 'ASC'], ['created_at', 'ASC']],
+    });
+    return success(res, items);
+  } catch (err) { next(err); }
+};
+
+// ── POST /works/:id/items ──────────────────────────────────────
+const createItem = async (req, res, next) => {
+  const t = await sequelize.transaction();
+  try {
+    const work = await Work.findOne({ where: { id: req.params.id, company_id: req.company_id }, transaction: t });
+    if (!work) throw createError('Obra no encontrada', 404);
+
+    const {
+      description, unit, initial_qty, unit_cost, unit_price,
+      catalog_rubro_id, sort_order,
+    } = req.body;
+
+    if (!description) throw createError('Descripción del rubro requerida', 400);
+    if (!unit)        throw createError('Unidad requerida', 400);
+
+    const qty  = parseFloat(initial_qty || 0);
+    const cost = parseFloat(unit_cost   || 0);
+    // Calcular precio al cliente aplicando utilidad e imprevistos sobre el costo
+    const { costToPrice } = require('../utils/budgetCalculator');
+    const price = parseFloat(unit_price || costToPrice(cost, work.utility_pct, work.contingency_pct));
+
+    const item = await WorkItem.create({
+      company_id:       req.company_id,
+      work_id:          work.id,
+      catalog_rubro_id: catalog_rubro_id || null,
+      description,
+      unit,
+      initial_qty:    qty,
+      real_qty:       0,
+      unit_cost:      cost,
+      unit_price:     price,
+      initial_total:  qty * price,
+      real_total:     0,
+      progress_pct:   0,
+      sort_order:     sort_order ?? 0,
+    }, { transaction: t });
+
+    // Recalcular initial_budget de la obra
+    const allItems = await WorkItem.findAll({ where: { work_id: work.id }, transaction: t });
+    const newBudget = calculateBudget(
+      allItems.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
+      work.utility_pct, work.contingency_pct
+    );
+    await work.update({ initial_budget: newBudget.total }, { transaction: t });
+
+    await t.commit();
+    return created(res, item, 'Rubro agregado');
+  } catch (err) {
+    await t.rollback();
+    next(err);
+  }
+};
+
+// ── PUT /works/:id/items/:itemId ───────────────────────────────
+const updateItem = async (req, res, next) => {
+  const t = await sequelize.transaction();
+  try {
+    const work = await Work.findOne({ where: { id: req.params.id, company_id: req.company_id }, transaction: t });
+    if (!work) throw createError('Obra no encontrada', 404);
+
+    const item = await WorkItem.findOne({
+      where: { id: req.params.itemId, work_id: work.id, company_id: req.company_id },
+      transaction: t,
+    });
+    if (!item) throw createError('Rubro no encontrado', 404);
+
+    const {
+      description, unit, initial_qty, unit_cost, unit_price,
+      real_qty, progress_pct, sort_order,
+    } = req.body;
+
+    const qty  = parseFloat(initial_qty ?? item.initial_qty);
+    const cost = parseFloat(unit_cost   ?? item.unit_cost);
+    // Recalcular precio cliente si cambió el costo (a menos que venga explícito)
+    const { costToPrice: costToPrice2 } = require('../utils/budgetCalculator');
+    const price = parseFloat(unit_price ?? costToPrice2(cost, work.utility_pct, work.contingency_pct));
+    const rQty  = parseFloat(real_qty ?? item.real_qty);
+
+    await item.update({
+      description:   description ?? item.description,
+      unit:          unit        ?? item.unit,
+      initial_qty:   qty,
+      unit_cost:     cost,
+      unit_price:    price,
+      initial_total: qty * price,
+      real_qty:      rQty,
+      real_total:    rQty * cost,
+      progress_pct:  parseFloat(progress_pct ?? item.progress_pct),
+      sort_order:    sort_order ?? item.sort_order,
+    }, { transaction: t });
+
+    // Recalcular initial_budget y real_cost de la obra
+    const allItems = await WorkItem.findAll({ where: { work_id: work.id }, transaction: t });
+    const newBudget = calculateBudget(
+      allItems.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
+      work.utility_pct, work.contingency_pct
+    );
+    const newRealCost = allItems.reduce((s, i) => s + parseFloat(i.real_total || 0), 0);
+    const newProgress = calculateWeightedProgress(allItems);
+
+    await work.update({
+      initial_budget:  newBudget.total,
+      real_cost:       newRealCost,
+      actual_progress: newProgress,
+    }, { transaction: t });
+
+    await t.commit();
+    return success(res, item, 'Rubro actualizado');
+  } catch (err) {
+    await t.rollback();
+    next(err);
+  }
+};
+
+// ── DELETE /works/:id/items/:itemId ───────────────────────────
+const deleteItem = async (req, res, next) => {
+  const t = await sequelize.transaction();
+  try {
+    const work = await Work.findOne({ where: { id: req.params.id, company_id: req.company_id }, transaction: t });
+    if (!work) throw createError('Obra no encontrada', 404);
+
+    const item = await WorkItem.findOne({
+      where: { id: req.params.itemId, work_id: work.id, company_id: req.company_id },
+      transaction: t,
+    });
+    if (!item) throw createError('Rubro no encontrado', 404);
+
+    await item.destroy({ transaction: t });
+
+    // Recalcular presupuesto inicial al cliente (costo × márgenes)
+    const allItems  = await WorkItem.findAll({ where: { work_id: work.id }, transaction: t });
+    const newBudget = calculateBudget(
+      allItems.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
+      work.utility_pct, work.contingency_pct
+    );
+    await work.update({ initial_budget: newBudget.total }, { transaction: t });
+
+    await t.commit();
+    return success(res, { id: req.params.itemId }, 'Rubro eliminado');
+  } catch (err) {
+    await t.rollback();
+    next(err);
+  }
+};
+
+module.exports = {
+  getAll, getOne, create, createFromProject, update, remove,
+  getBudgetSummary, updateProgress, getCurveS, closeWork,
+  // CRUD items
+  getItems, createItem, updateItem, deleteItem,
+};
