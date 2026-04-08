@@ -31,7 +31,26 @@ const getAll = async (req, res, next) => {
       offset: (parseInt(page) - 1) * parseInt(limit),
     });
 
-    return paginated(res, rows, count, page, limit);
+    // Enriquecer con total de subcontratos para mostrar presupuesto total en la lista
+    const workIds = rows.map(w => w.id);
+    let subTotals = {};
+    if (workIds.length > 0) {
+      const subRows = await sequelize.query(`
+        SELECT work_id, COALESCE(SUM(contracted_amount), 0) AS total_subcontracts
+        FROM subcontracts
+        WHERE work_id IN (:ids) AND company_id = :cid AND status != 'CANCELLED'
+        GROUP BY work_id
+      `, { replacements: { ids: workIds, cid: req.company_id }, type: QueryTypes.SELECT });
+      subRows.forEach(r => { subTotals[r.work_id] = parseFloat(r.total_subcontracts || 0); });
+    }
+
+    const enriched = rows.map(w => ({
+      ...w.toJSON(),
+      subcontracts_total: subTotals[w.id] || 0,
+      total_obra: parseFloat(w.initial_budget || 0) + (subTotals[w.id] || 0),
+    }));
+
+    return paginated(res, enriched, count, page, limit);
   } catch (err) { next(err); }
 };
 
@@ -133,8 +152,16 @@ const getBudgetSummary = async (req, res, next) => {
     // Avance combinado (rubros + subcontratos ponderado por costo)
     const progress = await calcCombinedProgress(work.id, req.company_id);
 
-    // Burn rate
-    const burn = budgetBurnRate(realCost, initialBudget.total, progress);
+    // Total subcontratos de la obra
+    const [subRow] = await sequelize.query(
+      `SELECT COALESCE(SUM(contracted_amount),0) AS total FROM subcontracts WHERE work_id = :wid AND company_id = :cid AND status != 'CANCELLED'`,
+      { replacements: { wid: work.id, cid: req.company_id }, type: QueryTypes.SELECT }
+    );
+    const subcontractsTotal = parseFloat(subRow?.total || 0);
+    const totalObra = initialBudget.total + subcontractsTotal;
+
+    // Burn rate — usar total obra (recursos propios + subcontratos)
+    const burn = budgetBurnRate(realCost, totalObra, progress);
 
     // Datos del contrato/proyecto vinculado (para panel de rentabilidad)
     let contractData = null;
@@ -456,14 +483,26 @@ const updateItem = async (req, res, next) => {
     const {
       description, unit, initial_qty, unit_cost, unit_price,
       real_qty, progress_pct, sort_order,
+      paid_at,       // fecha de pago confirmada por el ing. — null = por pagar
+      mark_as_paid,  // boolean explícito: true=pagado, false=desmarcar
     } = req.body;
 
     const qty  = parseFloat(initial_qty ?? item.initial_qty);
     const cost = parseFloat(unit_cost   ?? item.unit_cost);
-    // Recalcular precio cliente si cambió el costo (a menos que venga explícito)
     const { costToPrice: costToPrice2 } = require('../utils/budgetCalculator');
     const price = parseFloat(unit_price ?? costToPrice2(cost, work.utility_pct, work.contingency_pct));
     const rQty  = parseFloat(real_qty ?? item.real_qty);
+
+    // Determinar nuevo paid_at:
+    // - mark_as_paid=true  → pagar ahora (usar paid_at del body o fecha actual)
+    // - mark_as_paid=false → desmarcar (null)
+    // - mark_as_paid no viene → mantener valor actual
+    let newPaidAt = item.paid_at;
+    if (typeof mark_as_paid === 'boolean') {
+      newPaidAt = mark_as_paid ? (paid_at || new Date()) : null;
+    } else if ('paid_at' in req.body) {
+      newPaidAt = paid_at; // compatibilidad hacia atrás
+    }
 
     await item.update({
       description:   description ?? item.description,
@@ -476,7 +515,13 @@ const updateItem = async (req, res, next) => {
       real_total:    rQty * cost,
       progress_pct:  parseFloat(progress_pct ?? item.progress_pct),
       sort_order:    sort_order ?? item.sort_order,
-    }, { transaction: t });
+      paid_at:       newPaidAt,
+    }, {
+      transaction: t,
+      // Forzar actualización de paid_at incluso cuando es null
+      fields: ['description','unit','initial_qty','unit_cost','unit_price',
+               'initial_total','real_qty','real_total','progress_pct','sort_order','paid_at'],
+    });
 
     // Recalcular initial_budget y real_cost de la obra
     const allItems = await WorkItem.findAll({ where: { work_id: work.id }, transaction: t });
@@ -492,6 +537,49 @@ const updateItem = async (req, res, next) => {
       real_cost:       newRealCost,
       actual_progress: newProgress,
     }, { transaction: t });
+
+    // ── Sincronizar con finanzas ─────────────────────────────────
+    // IMPORTANTE: solo se registra el egreso cuando el ing. confirma el pago (paid_at != null)
+    // Si paid_at es null significa "por pagar" — el material está en obra pero aún no se pagó
+    const { FinancialTransaction } = require('../models');
+    const newRealTotal  = rQty * cost;
+    const txDescription = `Rubro obra: ${description ?? item.description}`;
+    const txRef         = `ITEM_${item.id}`;
+    const isPaid        = !!newPaidAt;
+
+    const existingTx = await FinancialTransaction.findOne({
+      where: { work_id: work.id, company_id: req.company_id, reference: txRef },
+      transaction: t,
+    });
+
+    if (isPaid && newRealTotal > 0) {
+      // Confirmado como pagado → crear o actualizar transacción con fecha real de pago
+      const paidDate = new Date(newPaidAt).toISOString().substring(0, 10);
+      if (existingTx) {
+        await existingTx.update({
+          amount:           newRealTotal,
+          description:      txDescription,
+          transaction_date: paidDate,
+        }, { transaction: t });
+      } else {
+        await FinancialTransaction.create({
+          company_id:       req.company_id,
+          work_id:          work.id,
+          type:             'EXPENSE',
+          category:         'MATERIAL_PURCHASE',
+          description:      txDescription,
+          amount:           newRealTotal,
+          transaction_date: paidDate,
+          recorded_by:      req.user?.id || null,
+          reference:        txRef,
+          is_reconciled:    true,
+        }, { transaction: t });
+      }
+    } else if (!isPaid && existingTx) {
+      // Desmarcado como pagado → eliminar la transacción
+      await existingTx.destroy({ transaction: t });
+    }
+    // Si isPaid=false y no existe transacción → no hacer nada (por pagar, sin egreso)
 
     await t.commit();
     return success(res, item, 'Rubro actualizado');
@@ -516,13 +604,21 @@ const deleteItem = async (req, res, next) => {
 
     await item.destroy({ transaction: t });
 
-    // Recalcular presupuesto inicial al cliente (costo × márgenes)
+    // Eliminar la transacción financiera asociada a este rubro (si existe)
+    const { FinancialTransaction } = require('../models');
+    await FinancialTransaction.destroy({
+      where: { work_id: work.id, company_id: req.company_id, reference: `ITEM_${item.id}` },
+      transaction: t,
+    });
+
+    // Recalcular presupuesto y costo real
     const allItems  = await WorkItem.findAll({ where: { work_id: work.id }, transaction: t });
     const newBudget = calculateBudget(
       allItems.map(i => ({ quantity: i.initial_qty, unit_price: parseFloat(i.unit_cost || i.unit_price || 0) })),
       work.utility_pct, work.contingency_pct
     );
-    await work.update({ initial_budget: newBudget.total }, { transaction: t });
+    const newRealCost = allItems.reduce((s, i) => s + parseFloat(i.real_total || 0), 0);
+    await work.update({ initial_budget: newBudget.total, real_cost: newRealCost }, { transaction: t });
 
     await t.commit();
     return success(res, { id: req.params.itemId }, 'Rubro eliminado');

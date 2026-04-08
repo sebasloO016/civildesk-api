@@ -65,3 +65,24 @@ SELECT
   COUNT(*) FILTER (WHERE is_billed = FALSE) AS pendientes,
   COUNT(*) FILTER (WHERE is_billed = TRUE)  AS conciliados
 FROM report_purchases;
+
+-- ═══════════════════════════════════════════════════════════════
+-- CivilDesk — Migración: Estado de pago en rubros de obra
+-- Ejecutar en psql: \i migration_work_items_paid_at.sql
+-- ═══════════════════════════════════════════════════════════════
+ 
+-- Una sola columna: NULL = por pagar, fecha = pagado ese día
+ALTER TABLE work_items
+  ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+ 
+-- Índice para consultas "rubros pagados de una obra"
+CREATE INDEX IF NOT EXISTS idx_work_items_paid_at
+  ON work_items(work_id, paid_at)
+  WHERE paid_at IS NOT NULL;
+ 
+-- Verificar
+SELECT
+  COUNT(*) FILTER (WHERE paid_at IS NULL)     AS por_pagar,
+  COUNT(*) FILTER (WHERE paid_at IS NOT NULL) AS pagados
+FROM work_items;
+ 

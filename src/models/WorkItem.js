@@ -17,6 +17,13 @@ const WorkItem = sequelize.define('WorkItem', {
   real_total:       { type: DataTypes.DECIMAL(14,2), defaultValue: 0 },
   progress_pct:     { type: DataTypes.DECIMAL(5,2),  defaultValue: 0 },
   sort_order:       { type: DataTypes.INTEGER, defaultValue: 0 },
+
+  // ── Estado de pago ────────────────────────────────────────────
+  // NULL    = Por pagar (material en obra, pago pendiente)
+  // fecha   = Pagado — registra exactamente cuándo el ing. confirmó el pago
+  // Este campo controla si el egreso se registra en financial_transactions
+  paid_at: { type: DataTypes.DATE, allowNull: true, defaultValue: null },
+
 }, { tableName: 'work_items' });
 
 module.exports = WorkItem;
